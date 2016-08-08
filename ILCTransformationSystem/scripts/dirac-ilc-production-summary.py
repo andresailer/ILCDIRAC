@@ -12,37 +12,14 @@ Options:
    -S, --Statuses statusList     Statuses, comma separated, default all
 
 """
-__RCSID__ = "$Id$"
+
+import os
+from collections import defaultdict
 
 from DIRAC.Core.Base import Script
-from DIRAC import S_OK, exit as dexit
-import os
+from DIRAC import S_OK, exit as dexit, gLogger
 
-def _getFileInfo(lfn):
-  """ Retrieve the file info
-  """
-  from DIRAC.Resources.Catalog.FileCatalogClient import FileCatalogClient
-  from DIRAC.Core.Utilities import DEncode
-  from DIRAC import gLogger
-  fc = FileCatalogClient()
-  lumi = 0
-  nbevts = 0
-  res  = fc.getFileUserMetadata(lfn)
-  if not res['OK']:
-    gLogger.error("Failed to get metadata of %s" % lfn)
-    return (0,0,{})
-  if 'Luminosity' in res['Value']:
-    lumi += float(res['Value']['Luminosity'])
-  addinfo = {}
-  if 'AdditionalInfo' in res['Value']:
-    addinfo = res['Value']['AdditionalInfo']
-    if addinfo.count("{"):
-      addinfo = eval(addinfo)
-    else:
-      addinfo = DEncode.decode(addinfo)[0]
-  if "NumberOfEvents" in res['Value'].keys():
-    nbevts += int(res['Value']['NumberOfEvents'])
-  return (float(lumi),int(nbevts),addinfo)
+__RCSID__ = "$Id$"
 
 def _translate(detail):
   """ Replace whizard naming convention by human conventions
@@ -83,7 +60,7 @@ def _translate(detail):
   detail = detail.replace(' H ->',', H ->')
   detail = detail.replace(' Z0 ->',', Z0 ->')
   detail = detail.replace(' W ->',', W ->')
-  
+
   return detail
 
 #def getAncestor(lfn):
@@ -112,7 +89,7 @@ class _Params(object):
     self.verbose = False
     self.ptypes = ['MCGeneration','MCSimulation','MCReconstruction',"MCReconstruction_Overlay"]
     self.statuses = ['Active','Stopped','Completed','Archived']
-    
+
   def setProdID(self, opt):
     """ Set the prodID to use. can be a range, a list, a unique value
     and a 'greater than' value
@@ -129,13 +106,13 @@ class _Params(object):
       if part.count("-"):
         prods.extend(range(int(part.split("-")[0]), int(part.split("-")[1])+1))
       else:
-        prods.append(int(part))  
+        prods.append(int(part))
     self.prod = prods
 
     return S_OK()
 
   def setFullDetail(self,dummy_opt):
-    """ Get every individual file's properties, makes this 
+    """ Get every individual file's properties, makes this
     very very slow
     """
     self.full_det = True
@@ -171,50 +148,154 @@ class _Params(object):
                                          '\nUsage:',
                                          '  %s [option|cfgfile] ...\n' % Script.scriptName ] ) )
 
-def _getProductionSummary():
-  clip = _Params()
-  clip.registerSwitch()
-  Script.parseCommandLine()
-  from ILCDIRAC.Core.Utilities.HTML                             import Table
-  from ILCDIRAC.Core.Utilities.ProcessList                      import ProcessList
-  from DIRAC.TransformationSystem.Client.TransformationClient   import TransformationClient
-  from DIRAC.Resources.Catalog.FileCatalogClient import FileCatalogClient
-  from DIRAC import gConfig, gLogger
-  prod = clip.prod
-  full_detail = clip.full_det
-  fc = FileCatalogClient()
-  
-  processlist = gConfig.getValue('/LocalSite/ProcessListPath')
-  prl = ProcessList(processlist)
-  processesdict = prl.getProcessesDict()
-  
-  trc = TransformationClient()
-  prodids = []
-  if not prod:
-    conddict = {}
-    conddict['Status'] = clip.statuses
-    if clip.ptypes:
-      conddict['Type'] = clip.ptypes
-    res = trc.getTransformations( conddict )
+
+class ProductionSummary( object ):
+  """ create production summary table """
+
+  def __init__( self, clip ):
+    from DIRAC.Resources.Catalog.FileCatalogClient import FileCatalogClient
+    from DIRAC.TransformationSystem.Client.TransformationClient   import TransformationClient
+
+    self.prod = clip.prod
+    self.fullDetail = clip.full_det
+    self.minprod = clip.minprod
+    self.statuses = clip.statuses
+    self.ptypes = clip.ptypes
+    self.fcc = FileCatalogClient()
+    self.trc = TransformationClient()
+    
+  def getProductionSummary( self ):
+    """ create the production summary overview table """
+    from ILCDIRAC.Core.Utilities.HTML                             import Table
+
+    prodids = self.prod if self.prod else self._getProdIDs( )
+    gLogger.info( "Will run on prods: %s" % prodids )
+
+    if not prodids:
+      return 1
+
+    metadata = []
+
+    for prodID in prodids:
+      if prodID < self.minprod:
+        continue
+      self.getMetadata( metadata, prodID )
+
+    detectors = {}
+    detectors['ILD'] = {}
+    corres = {"MCGeneration":'gen',"MCSimulation":'SIM',"MCReconstruction":"REC","MCReconstruction_Overlay":"REC"}
+    detectors['ILD']['SIM'] = []
+    detectors['ILD']['REC'] = []
+    detectors['SID'] = {}
+    detectors['SID']['SIM'] = []
+    detectors['SID']['REC'] = []
+    detectors['sid'] = {}
+    detectors['sid']['SIM'] = []
+    detectors['sid']['REC'] = []
+    detectors['gen']=[]
+    for channel in metadata:
+      if 'DetectorType'  not in channel:
+        detectors['gen'].append((channel['detail'],
+                                 channel['Energy'],
+                                 channel['ProdID'],
+                                 channel['nb_files'],
+                                 channel['NumberOfEvents']/channel['nb_files'],
+                                 channel['NumberOfEvents'],
+                                 channel['CrossSection'],str(channel['proddetail'])))
+      else:
+        if not channel['DetectorType'] in detectors:
+          gLogger.error("This is unknown detector", channel['DetectorType'])
+          continue
+        detectors[channel['DetectorType']][corres[channel['prodtype']]].append((channel['detail'],
+                                                                                channel['Energy'],
+                                                                                channel['DetectorType'],
+                                                                                channel['ProdID'],
+                                                                                channel['nb_files'],
+                                                                                channel['NumberOfEvents']/channel['nb_files'],
+                                                                                channel['NumberOfEvents'],
+                                                                                channel['CrossSection'],
+                                                                                channel['MomProdID'],
+                                                                                str(channel['proddetail'])))
+
+    with open("tables.html","w") as of:
+      of.write("""<!DOCTYPE html>
+<html>
+ <head>
+<title> Production summary </title>
+</head>
+<body>
+""")
+      if len(detectors['gen']):
+        of.write("<h1>gen prods</h1>\n")
+        table = Table(header_row = ('Channel', 'Energy','ProdID','Tasks','Average Evts/task','Statistics','Cross Section (fb)','Comment'))
+        for item in detectors['gen']:
+          table.rows.append( item )
+        of.write(str(table))
+        gLogger.info("Gen prods")
+        gLogger.info(str(table))
+
+      if len(detectors['ILD']):
+        of.write("<h1>ILD prods</h1>\n")
+        for ptype in detectors['ILD'].keys():
+          if len(detectors['ILD'][ptype]):
+            of.write("<h2>%s</h2>\n"%ptype)
+            table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
+            for item in detectors['ILD'][ptype]:
+              table.rows.append( item )
+            of.write(str(table))
+            gLogger.info("ILC CDR prods %s" % ptype)
+            gLogger.info(str(table))
+
+      if len(detectors['SID']):
+        of.write("<h1>SID prods</h1>\n")
+        for ptype in detectors['SID'].keys():
+          if len(detectors['SID'][ptype]):
+            of.write("<h2>%s</h2>\n"%ptype)
+            table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
+            for item in detectors['SID'][ptype]:
+              table.rows.append( item )
+            of.write(str(table))
+            gLogger.info("SID CDR prods %s"%ptype)
+            gLogger.info(str(table))
+
+      if len(detectors['sid']):
+        of.write("<h1>sid dbd prods</h1>\n")
+        for ptype in detectors['sid'].keys():
+          if len(detectors['sid'][ptype]):
+            of.write("<h2>%s</h2>\n"%ptype)
+            table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
+            for item in detectors['sid'][ptype]:
+              table.rows.append( item )
+            of.write(str(table))
+            gLogger.info("sid DBD prods %s"%ptype)
+            gLogger.info(str(table))
+
+      of.write("""
+</body>
+</html>
+""")
+    gLogger.notice("Check ./tables.html in any browser for the results")
+    dexit(0)
+
+  def _getProdIDs( self ):
+    """ get the production ids if none are given """
+    prodids = []
+    conddict = { 'Status': self.statuses }
+    if self.ptypes:
+      conddict['Type'] = self.ptypes
+    res = self.trc.getTransformations( conddict )
     if res['OK']:
       for transfs in res['Value']:
-        prodids.append(transfs['TransformationID'])
-  else:
-    prodids.extend(prod)
+        prodids.append( transfs['TransformationID'] )
+    return prodids
 
-  metadata = []
-  
-  gLogger.info("Will run on prods %s" % str(prodids))
-  
-  for prodID in prodids:
-    if prodID<clip.minprod:
-      continue
-    meta = {}
-    meta['ProdID']=prodID
-    res = trc.getTransformation(str(prodID))
+  def getMetadata( self, metadata, prodID ):
+    """ get metadata for production, append to metadata """
+    meta = { 'ProdID': prodID }
+    res = self.trc.getTransformation(str(prodID))
     if not res['OK']:
       gLogger.error("Error getting transformation %s" % prodID )
-      continue
+      return
     prodtype = res['Value']['Type']
     proddetail = res['Value']['Description']
     if prodtype == 'MCReconstruction' or prodtype == 'MCReconstruction_Overlay' :
@@ -225,25 +306,25 @@ def _getProductionSummary():
       meta['Datatype']='SIM'
     elif prodtype in ['Split','Merge']:
       gLogger.warn("Invalid query for %s productions" % prodtype)
-      continue
+      return
     else:
       gLogger.error("Unknown production type %s"% prodtype)
-      continue
-    res = fc.findFilesByMetadata(meta)  
+      return
+    res = self.fcc.findFilesByMetadata(meta)
     if not res['OK']:
       gLogger.error(res['Message'])
-      continue
+      return
     lfns = res['Value']
     nb_files = len(lfns)
     path = ""
     if not len(lfns):
       gLogger.warn("No files found for prod %s" % prodID)
-      continue
+      return
     path = os.path.dirname(lfns[0])
-    res = fc.getDirectoryUserMetadata(path)
+    res = self.fcc.getDirectoryUserMetadata(path)
     if not res['OK']:
       gLogger.warn('No meta data found for %s' % path)
-      continue
+      return
     dirmeta = {}
     dirmeta['proddetail'] = proddetail
     dirmeta['prodtype'] = prodtype
@@ -254,62 +335,36 @@ def _getProductionSummary():
     addinfo = None
     files = 0
     xsec = 0.0
-    if not full_detail:
-      lfn  = lfns[0]
-      info = _getFileInfo(lfn)
+    if not self.fullDetail:
+      info = self._getFileInfo( lfns[0] )
       nbevts = info[1]*len(lfns)
       lumi = info[0]*len(lfns)
       addinfo = info[2]
-      if 'xsection' in addinfo:
-        if 'sum' in addinfo['xsection']:
-          if 'xsection' in addinfo['xsection']['sum']:
-            xsec += addinfo['xsection']['sum']['xsection']
-            files += 1
+      if 'xsection' in addinfo and 'sum' in addinfo['xsection'] and 'xsection' in addinfo['xsection']['sum']:
+        xsec += addinfo['xsection']['sum']['xsection']
+        files += 1
     else:
       for lfn in lfns:
-        info = _getFileInfo(lfn)
+        info = self._getFileInfo( lfn )
         lumi += info[0]
         nbevts += info[1]
         addinfo = info[2]
-        if 'xsection' in addinfo:
-          if 'sum' in addinfo['xsection']:
-            if 'xsection' in addinfo['xsection']['sum']:
-              xsec += addinfo['xsection']['sum']['xsection']
-              files += 1
+        if 'xsection' in addinfo and 'sum' in addinfo['xsection'] and 'xsection' in addinfo['xsection']['sum']:
+          xsec += addinfo['xsection']['sum']['xsection']
+          files += 1
+
     if not lumi:
-      xsec = 0
-      files = 0
-      depthDict = {}  
-      depSet = set()  
-      res = fc.getFileAncestors(lfns,[1,2,3,4])
-      temp_ancestorlist = []
-      if res['OK']:
-        for lfn,ancestorsDict in res['Value']['Successful'].items():
-          for ancestor,dep in ancestorsDict.items():
-            depthDict.setdefault(dep,[])
-            if ancestor not in temp_ancestorlist:
-              depthDict[dep].append(ancestor)
-              depSet.add(dep)
-              temp_ancestorlist.append(ancestor)
-      depList = list(depSet)
-      depList.sort()
-      for ancestor in depthDict[depList[-1]]:
-        info = _getFileInfo(ancestor)
-        lumi += info[0]
-        addinfo = info[2]
-        if 'xsection' in addinfo:
-          if 'sum' in addinfo['xsection']:
-            if 'xsection' in addinfo['xsection']['sum']:
-              xsec += addinfo['xsection']['sum']['xsection']
-              files += 1
+      xsec, files = self.getXSecFromFilesMetadata( lfns )
+
     if xsec and files:
       xsec /= files
       dirmeta['CrossSection']=xsec
     else:
       dirmeta['CrossSection']=0.0
-          
+
     if nbevts:
       dirmeta['NumberOfEvents']=nbevts
+
     #if not lumi:
     #  dirmeta['Luminosity']=0
     #  dirmeta['CrossSection']=0
@@ -323,20 +378,28 @@ def _getProductionSummary():
     #    if 'sum' in addinfo['xsection']:
     #      if 'xsection' in addinfo['xsection']['sum']:
     #        dirmeta['CrossSection']=addinfo['xsection']['sum']['xsection']
+
     if 'NumberOfEvents' not in dirmeta:
       dirmeta['NumberOfEvents']=0
     #print processesdict[dirmeta['EvtType']]
+    from ILCDIRAC.Core.Utilities.ProcessList                      import ProcessList
+    from DIRAC import gConfig
+
+    processlist = gConfig.getValue('/LocalSite/ProcessListPath')
+    prl = ProcessList(processlist)
+    processesdict = prl.getProcessesDict()
+
     dirmeta['detail']=''
     if dirmeta['EvtType'] not in processesdict:
       if 'Detail' in processesdict[dirmeta['EvtType']]:
         detail = processesdict[dirmeta['EvtType']]['Detail']
-        
+
     else:
       detail=dirmeta['EvtType']
-  
-  
+
+
     if not prodtype == 'MCGeneration':
-      res = trc.getTransformationInputDataQuery(str(prodID))
+      res = self.trc.getTransformationInputDataQuery(str(prodID))
       if res['OK']:
         if 'ProdID' in res['Value']:
           dirmeta['MomProdID']=res['Value']['ProdID']
@@ -345,102 +408,62 @@ def _getProductionSummary():
     dirmeta['detail']= _translate(detail)
 
     metadata.append(dirmeta)
-  
-  detectors = {}
-  detectors['ILD'] = {}
-  corres = {"MCGeneration":'gen',"MCSimulation":'SIM',"MCReconstruction":"REC","MCReconstruction_Overlay":"REC"}
-  detectors['ILD']['SIM'] = []
-  detectors['ILD']['REC'] = []
-  detectors['SID'] = {}
-  detectors['SID']['SIM'] = []
-  detectors['SID']['REC'] = []
-  detectors['sid'] = {}
-  detectors['sid']['SIM'] = []
-  detectors['sid']['REC'] = []
-  detectors['gen']=[]
-  for channel in metadata:
-    if 'DetectorType'  not in channel:
-      detectors['gen'].append((channel['detail'],
-                               channel['Energy'],
-                               channel['ProdID'],
-                               channel['nb_files'],
-                               channel['NumberOfEvents']/channel['nb_files'],
-                               channel['NumberOfEvents'],
-                               channel['CrossSection'],str(channel['proddetail'])))
-    else:
-      if not channel['DetectorType'] in detectors:
-        gLogger.error("This is unknown detector", channel['DetectorType'])
-        continue
-      detectors[channel['DetectorType']][corres[channel['prodtype']]].append((channel['detail'],
-                                                                              channel['Energy'],
-                                                                              channel['DetectorType'],
-                                                                              channel['ProdID'],
-                                                                              channel['nb_files'],
-                                                                              channel['NumberOfEvents']/channel['nb_files'],
-                                                                              channel['NumberOfEvents'],
-                                                                              channel['CrossSection'],
-                                                                              channel['MomProdID'],
-                                                                              str(channel['proddetail'])))
-  
-  with open("tables.html","w") as of:
-    of.write("""<!DOCTYPE html>
-<html>
- <head>
-<title> Production summary </title>
-</head>
-<body>
-""")
-    if len(detectors['gen']):
-      of.write("<h1>gen prods</h1>\n")
-      table = Table(header_row = ('Channel', 'Energy','ProdID','Tasks','Average Evts/task','Statistics','Cross Section (fb)','Comment'))
-      for item in detectors['gen']:
-        table.rows.append( item )
-      of.write(str(table))
-      gLogger.info("Gen prods")
-      gLogger.info(str(table))
 
-    if len(detectors['ILD']):
-      of.write("<h1>ILD prods</h1>\n")
-      for ptype in detectors['ILD'].keys():
-        if len(detectors['ILD'][ptype]):
-          of.write("<h2>%s</h2>\n"%ptype)
-          table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
-          for item in detectors['ILD'][ptype]:
-            table.rows.append( item )
-          of.write(str(table))
-          gLogger.info("ILC CDR prods %s" % ptype)
-          gLogger.info(str(table))
+  def getXSecFromFilesMetadata( self, lfns ):
+    xsec = 0
+    files = 0
+    depthDict = defaultdict( list )
+    depSet = set()
+    res = self.fcc.getFileAncestors( lfns, [1,2,3,4] )
+    if not res['OK']:
+      raise RuntimeError("Faild to get file ancestors: %s " % res['Message'] )
 
-    if len(detectors['SID']):
-      of.write("<h1>SID prods</h1>\n")
-      for ptype in detectors['SID'].keys():
-        if len(detectors['SID'][ptype]):
-          of.write("<h2>%s</h2>\n"%ptype)
-          table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
-          for item in detectors['SID'][ptype]:
-            table.rows.append( item )
-          of.write(str(table))
-          gLogger.info("SID CDR prods %s"%ptype)
-          gLogger.info(str(table))
+    temp_ancestorlist = []
+    for _lfn,ancestorsDict in res['Value']['Successful'].iteritems():
+      for ancestor,dep in ancestorsDict.items():
+        if ancestor not in temp_ancestorlist:
+          depthDict[dep].append(ancestor)
+          depSet.add(dep)
+          temp_ancestorlist.append(ancestor)
+    depList = list(depSet)
+    depList.sort()
+    for ancestor in depthDict[depList[-1]]:
+      info = self._getFileInfo(ancestor)
+      addinfo = info[2]
+      if 'xsection' in addinfo and 'sum' in addinfo['xsection'] and 'xsection' in addinfo['xsection']['sum']:
+        xsec += addinfo['xsection']['sum']['xsection']
+        files += 1
 
-    if len(detectors['sid']):
-      of.write("<h1>sid dbd prods</h1>\n")
-      for ptype in detectors['sid'].keys():
-        if len(detectors['sid'][ptype]):
-          of.write("<h2>%s</h2>\n"%ptype)
-          table = Table(header_row = ('Channel', 'Energy','Detector','ProdID','Number of Files','Events/File','Statistics','Cross Section (fb)','Origin ProdID','Comment'))
-          for item in detectors['sid'][ptype]:
-            table.rows.append( item )
-          of.write(str(table))
-          gLogger.info("sid DBD prods %s"%ptype)
-          gLogger.info(str(table))
+    return xsec, files
 
-    of.write("""
-</body>
-</html>
-""")
-  gLogger.notice("Check ./tables.html in any browser for the results")
-  dexit(0)
+  def _getFileInfo(self, lfn):
+    """ Retrieve the file info
+    """
+    from DIRAC.Core.Utilities import DEncode
+
+    lumi = 0
+    nbevts = 0
+    res = self.fcc.getFileUserMetadata(lfn)
+    if not res['OK']:
+      gLogger.error("Failed to get metadata of %s" % lfn)
+      return (0,0,{})
+    if 'Luminosity' in res['Value']:
+      lumi += float(res['Value']['Luminosity'])
+    addinfo = {}
+    if 'AdditionalInfo' in res['Value']:
+      addinfo = res['Value']['AdditionalInfo']
+      if addinfo.count("{"):
+        addinfo = eval(addinfo)
+      else:
+        addinfo = DEncode.decode(addinfo)[0]
+    if "NumberOfEvents" in res['Value']:
+      nbevts += int(res['Value']['NumberOfEvents'])
+    return (float(lumi),int(nbevts),addinfo)
 
 if __name__=="__main__":
-  _getProductionSummary()
+  CLIP = _Params()
+  CLIP.registerSwitch()
+  Script.parseCommandLine()
+  PRODSUM = ProductionSummary( CLIP )
+  RES = PRODSUM.getProductionSummary()
+  exit( RES )
